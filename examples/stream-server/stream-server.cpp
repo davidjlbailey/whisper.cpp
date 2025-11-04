@@ -8,6 +8,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <string>
 #include <thread>
@@ -40,6 +41,11 @@ struct whisper_params {
     std::string language  = "en";
     std::string model     = "models/ggml-base.en.bin";
     std::string fname_out;
+
+    std::string fname_wav;
+    bool use_wav_input = false;
+    std::string sock_address = "127.0.0.1";
+    int         sock_port    = 6666;
 };
 
 void whisper_print_usage(int argc, char ** argv, const whisper_params & params);
@@ -74,6 +80,9 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
         else if (arg == "-ng"   || arg == "--no-gpu")        { params.use_gpu       = false; }
         else if (arg == "-fa"   || arg == "--flash-attn")    { params.flash_attn    = true; }
         else if (arg == "-nfa"  || arg == "--no-flash-attn") { params.flash_attn    = false; }
+        else if (arg == "-a"    || arg == "--address")       { params.sock_address  = argv[++i]; }
+        else if (arg == "-p"    || arg == "--port")          { params.sock_port     = std::stoi(argv[++i]); }
+        else if (arg == "-i"    || arg == "--input")         { params.fname_wav     = argv[++i]; params.use_wav_input = true; }
 
         else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
@@ -113,7 +122,112 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "  -ng,      --no-gpu        [%-7s] disable GPU inference\n",                          params.use_gpu ? "false" : "true");
     fprintf(stderr, "  -fa,      --flash-attn    [%-7s] enable flash attention during inference\n",        params.flash_attn ? "true" : "false");
     fprintf(stderr, "  -nfa,     --no-flash-attn [%-7s] disable flash attention during inference\n",       params.flash_attn ? "false" : "true");
+    fprintf(stderr, "  -a ADDR,  --address ADDR  [%-7s] socket address to connect to\n",                   params.sock_address.c_str());
+    fprintf(stderr, "  -p PORT,  --port PORT     [%-7d] socket port to connect to\n",                      params.sock_port);
+    fprintf(stderr, "  -i FNAME,  --input FNAME  [%-7s] input wav file (for testing)\n",                   params.fname_wav.c_str());
     fprintf(stderr, "\n");
+}
+
+size_t read_wav_samples(const std::string &path,
+                        size_t start_sample,     // sample index (per channel) to start from
+                        size_t n_samples,        // number of samples per channel to read
+                        std::vector<float> &out, // resized to channels * n_samples on success (may be smaller)
+                        int &sample_rate,
+                        int &channels) {
+    out.clear();
+    sample_rate = 0;
+    channels = 0;
+
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs) return 0;
+
+    // RIFF header
+    char riff[4];
+    uint32_t chunk_size;
+    char wave[4];
+    ifs.read(riff, 4); ifs.read(reinterpret_cast<char*>(&chunk_size), 4); ifs.read(wave, 4);
+    if (std::memcmp(riff, "RIFF", 4) != 0 || std::memcmp(wave, "WAVE", 4) != 0) return 0;
+
+    // Find fmt and data chunks
+    uint16_t audio_format = 0;
+    uint16_t num_channels = 0;
+    uint32_t sample_rate_u = 0;
+    uint16_t bits_per_sample = 0;
+    uint32_t data_offset = 0;
+    uint32_t data_size = 0;
+
+    while (ifs && (!data_offset || !sample_rate_u)) {
+        char id[4];
+        uint32_t sz;
+        ifs.read(id, 4);
+        if (!ifs) break;
+        ifs.read(reinterpret_cast<char*>(&sz), 4);
+        if (!ifs) break;
+
+        if (std::memcmp(id, "fmt ", 4) == 0) {
+            // read fmt chunk (minimum 16 bytes)
+            uint16_t block_align;
+            uint32_t byte_rate;
+            ifs.read(reinterpret_cast<char*>(&audio_format), sizeof(audio_format));
+            ifs.read(reinterpret_cast<char*>(&num_channels), sizeof(num_channels));
+            ifs.read(reinterpret_cast<char*>(&sample_rate_u), sizeof(sample_rate_u));
+            ifs.read(reinterpret_cast<char*>(&byte_rate), sizeof(byte_rate));
+            ifs.read(reinterpret_cast<char*>(&block_align), sizeof(block_align));
+            ifs.read(reinterpret_cast<char*>(&bits_per_sample), sizeof(bits_per_sample));
+            // skip any extra fmt bytes
+            const int fmt_extra = (int)sz - 16;
+            if (fmt_extra > 0) ifs.seekg(fmt_extra, std::ios::cur);
+        } else if (std::memcmp(id, "data", 4) == 0) {
+            data_offset = static_cast<uint32_t>(ifs.tellg());
+            data_size   = sz;
+            ifs.seekg(sz, std::ios::cur);
+        } else {
+            // skip chunk
+            ifs.seekg(sz, std::ios::cur);
+        }
+    }
+
+    if (!sample_rate_u || !data_offset || !data_size) return 0;
+    sample_rate = static_cast<int>(sample_rate_u);
+    channels = static_cast<int>(num_channels);
+
+    const uint16_t fmt = audio_format; // 1 = PCM, 3 = IEEE float
+    const uint16_t bps = bits_per_sample;
+    const uint32_t bytes_per_sample = (bps/8) * channels;
+    const uint64_t total_frames = data_size / bytes_per_sample;
+
+    if (start_sample >= total_frames) return 0;
+    const size_t frames_to_read = std::min<uint64_t>(n_samples, total_frames - start_sample);
+
+    // Seek to the start position in bytes
+    const uint64_t start_byte = data_offset + start_sample * bytes_per_sample;
+    ifs.seekg(start_byte, std::ios::beg);
+    if (!ifs) return 0;
+
+    out.resize(frames_to_read * channels);
+
+    for (size_t f = 0; f < frames_to_read; ++f) {
+        for (int ch = 0; ch < channels; ++ch) {
+            if (fmt == 1 && bps == 16) {
+                int16_t s = 0;
+                ifs.read(reinterpret_cast<char*>(&s), sizeof(s));
+                out[f * channels + ch] = static_cast<float>(s) / 32768.0f;
+            } else if (fmt == 3 && bps == 32) {
+                float s = 0.0f;
+                ifs.read(reinterpret_cast<char*>(&s), sizeof(s));
+                out[f * channels + ch] = s;
+            } else if (fmt == 1 && bps == 8) {
+                uint8_t u = 0;
+                ifs.read(reinterpret_cast<char*>(&u), sizeof(u));
+                out[f * channels + ch] = (static_cast<int>(u) - 128) / 128.0f;
+            } else {
+                // unsupported format
+                return 0;
+            }
+        }
+    }
+
+    return frames_to_read;
 }
 
 int main(int argc, char ** argv) {
@@ -142,9 +256,30 @@ int main(int argc, char ** argv) {
     params.max_tokens     = 0;
 
     // init socket
+    std::vector<float> pcmf32_wav;
+    int sample_rate_wav = 0;
+    int channels_wav    = 0;
 
-    // TODO
-    
+    if (params.use_wav_input) {
+        read_wav_samples(params.fname_wav,
+                         0,
+                         n_samples_30s,
+                         pcmf32_wav,
+                         sample_rate_wav,
+                         channels_wav);
+        if (sample_rate_wav != WHISPER_SAMPLE_RATE) {
+            fprintf(stderr, "error: wav file sample rate %d != %d\n", sample_rate_wav, WHISPER_SAMPLE_RATE);
+            return 1;
+        }
+        if (channels_wav != 1) {
+            fprintf(stderr, "error: wav file must be mono (channels = %d)\n", channels_wav);
+            return 1;
+        }
+        printf("Opened WAV file %s with %d Hz, %d channels\n", params.fname_wav.c_str(), sample_rate_wav, channels_wav);
+    } else {
+        // TODO init network socket
+    }
+
     // whisper init
     if (params.language != "auto" && whisper_lang_id(params.language.c_str()) == -1){
         fprintf(stderr, "error: unknown language '%s'\n", params.language.c_str());
@@ -203,7 +338,6 @@ int main(int argc, char ** argv) {
 
     bool is_running = true;
 
-
     // main audio loop
     while (is_running) {
 
@@ -211,7 +345,39 @@ int main(int argc, char ** argv) {
             break;
         }
 
-        // TODO process new audio from socket
+        if (params.use_wav_input) {
+            printf("Reading WAV samples at iter %d (samples %d to %d)...\n", n_iter,
+                   n_iter * n_samples_step,
+                   n_iter * n_samples_step + n_samples_step);
+            read_wav_samples(params.fname_wav,
+                             n_iter * n_samples_step,
+                             n_samples_step,
+                             pcmf32_new,
+                             sample_rate_wav,
+                             channels_wav);
+
+            const int n_samples_new = pcmf32_new.size();
+            if (n_samples_new == 0) {
+                break;
+            }
+
+            // take up to params.length_ms audio from previous iteration
+            const int n_samples_take = std::min((int) pcmf32_old.size(), std::max(0, n_samples_keep + n_samples_len - n_samples_new));
+
+            printf("Processing: take = %d, new = %d, old = %d\n", n_samples_take, n_samples_new, (int) pcmf32_old.size());
+
+            pcmf32.resize(n_samples_new + n_samples_take);
+
+            for (int i = 0; i < n_samples_take; i++) {
+                pcmf32[i] = pcmf32_old[pcmf32_old.size() - n_samples_take + i];
+            }
+
+            memcpy(pcmf32.data() + n_samples_take, pcmf32_new.data(), n_samples_new*sizeof(float));
+
+            pcmf32_old = pcmf32;                             
+        } else {
+            // TODO receive audio over network socket
+        }
 
         // run the inference
         {
@@ -239,6 +405,8 @@ int main(int argc, char ** argv) {
             wparams.prompt_tokens    = params.no_context ? nullptr : prompt_tokens.data();
             wparams.prompt_n_tokens  = params.no_context ? 0       : prompt_tokens.size();
 
+            printf("Calling whisper_full() with %d samples...\n", (int) pcmf32.size());
+
             if (whisper_full(ctx, wparams, pcmf32.data(), pcmf32.size()) != 0) {
                 fprintf(stderr, "%s: failed to process audio\n", argv[0]);
                 return 6;
@@ -249,30 +417,32 @@ int main(int argc, char ** argv) {
                 const int n_segments = whisper_full_n_segments(ctx);
                 for (int i = 0; i < n_segments; ++i) {
                     const char * text = whisper_full_get_segment_text(ctx, i);
+                    if (params.use_wav_input) {
+                        printf("--> %s\n", text);
+                    } else {
+                        // TODO send text over socket
+                    }
                 }
             }
 
             ++n_iter;
 
-            if (!use_vad && (n_iter % n_new_line) == 0) {
-                printf("\n");
+            // keep part of the audio for next iteration to try to mitigate word boundary issues
+            pcmf32_old = std::vector<float>(pcmf32.end() - n_samples_keep, pcmf32.end());
 
-                // keep part of the audio for next iteration to try to mitigate word boundary issues
-                pcmf32_old = std::vector<float>(pcmf32.end() - n_samples_keep, pcmf32.end());
+            // Add tokens of the last full length segment as the prompt
+            if (!params.no_context) {
+                prompt_tokens.clear();
 
-                // Add tokens of the last full length segment as the prompt
-                if (!params.no_context) {
-                    prompt_tokens.clear();
-
-                    const int n_segments = whisper_full_n_segments(ctx);
-                    for (int i = 0; i < n_segments; ++i) {
-                        const int token_count = whisper_full_n_tokens(ctx, i);
-                        for (int j = 0; j < token_count; ++j) {
-                            prompt_tokens.push_back(whisper_full_get_token_id(ctx, i, j));
-                        }
+                const int n_segments = whisper_full_n_segments(ctx);
+                for (int i = 0; i < n_segments; ++i) {
+                    const int token_count = whisper_full_n_tokens(ctx, i);
+                    for (int j = 0; j < token_count; ++j) {
+                        prompt_tokens.push_back(whisper_full_get_token_id(ctx, i, j));
                     }
                 }
             }
+
             fflush(stdout);
         }
     }
