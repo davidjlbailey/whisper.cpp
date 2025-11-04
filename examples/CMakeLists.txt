@@ -116,6 +116,7 @@ else()
             add_subdirectory(sycl)
         endif()
     endif (WHISPER_SDL2)
+    add_subdirectory(stream-server)
 
     add_subdirectory(deprecation-warning)
 endif()

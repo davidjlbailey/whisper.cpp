@@ -16,6 +16,11 @@ build/
 build-*/
 build_*/
 tmp/
+bin/
+
+# CMake artefact
+CMakeFiles
+CMakeFiles/** 
 
 # SPM
 .build/

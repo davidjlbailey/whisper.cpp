@@ -15,5 +15,5 @@ RUN apt-get update && \
 RUN git clone https://github.com/davidjlbailey/whisper.cpp.git
 RUN make -C whisper.cpp base.en
 
-ENV PATH=/app/whisper.cpp/build/bin:$PATH
+ENV PATH=/app/whisper.cpp/bin:$PATH
 ENTRYPOINT [ "bash", "-c" ]
