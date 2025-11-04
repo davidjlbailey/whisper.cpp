@@ -1,0 +1,32 @@
+// For format details, see https://aka.ms/devcontainer.json. For config options, see the
+// README at: https://github.com/devcontainers/templates/tree/main/src/go
+{
+	"name": "Whisper.cpp",
+	"build": {
+		"dockerfile": "Dockerfile",
+		"context": "..",
+		"args": {}
+	},
+	"workspaceFolder": "/workspaces/whisper.cpp",
+	// Features to add to the dev container. More info: https://containers.dev/features.
+	"features": {},
+	// Use 'postCreateCommand' to run commands after the container is created.
+	"postCreateCommand": {},
+	// Add mounts for bash and git profiles
+	"mounts": [
+		"source=${localEnv:HOME}/.bashrc,target=/home/vscode/.bashrc,type=bind,readonly,consistency=cached",
+		"source=${localEnv:HOME}/.gitconfig,target=/home/vscode/.gitconfig,type=bind,readonly,consistency=cached"
+	],
+	// Configure tool-specific properties.
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"davidanson.vscode-markdownlint",
+				"mutantdino.resourcemonitor",
+				"streetsidesoftware.code-spell-checker",
+				"ms-vscode.cpptools",
+				"ms-vscode.cmake-tools"
+			]
+		}
+	}
+}
