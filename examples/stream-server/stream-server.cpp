@@ -1187,26 +1187,51 @@ int main(int argc, char ** argv) {
         std::vector<std::vector<float>> pcmf32s_old;
 
         // New samples to process (from the socket, or from file)
-        std::vector<float> pcmf32_new = pcmf32_full;
+        std::vector<float> pcmf32_new = pcmf32_full;   
         std::vector<std::vector<float>> pcmf32s_new = pcmf32s_full;
 
         // Parameters for overlapping segments
         const int KEEP = WHISPER_SAMPLE_RATE * 10; // 10 seconds
-        const int OVERLAP = WHISPER_SAMPLE_RATE * 8; // 8 seconds
-        const int STEP = KEEP - OVERLAP; // 2 seconds
+        const int OVER = WHISPER_SAMPLE_RATE * 8; // 8 seconds
+        const int STEP = KEEP - OVER; // 2 seconds
 
         // Loop over segments or socket reads
-        while (true) {
+        while (pcmf32_new.size() > 0) {
 
             // Read from socket and fill pcmf32_new and pcmf32s_new to STEP samples
-            {}
+            {
+                if (params.run_server) {
+                    // TODO - While new size is less than step, read from socket
+                }
+
+            }
 
             // Extract segment
             {
-                // pcmf32 = pcmf32_full;
-                // pcmf32s = pcmf32s_full;
+                pcmf32.clear();
+                pcmf32s.clear();
 
-                const int n_take = std::min<int>(STEP, (int) pcmf32.size());
+                const int n_take = std::min<int>(STEP, pcmf32_new.size());
+                const int n_over = std::min<int>(OVER, pcmf32_old.size());
+
+                // prepend overlap from previous segment
+                pcmf32.insert(pcmf32.end(), pcmf32_old.end() - n_over, pcmf32_old.end());
+                pcmf32.insert(pcmf32.end(), pcmf32_new.begin(), pcmf32_new.begin() + n_take);
+                for (int ch =0 ; ch< pcmf32s_new.size(); ch++) {
+                    pcmf32s[ch].clear();
+                    pcmf32s[ch].insert(pcmf32s[ch].end(), pcmf32s_old[ch].end() - n_over, pcmf32s_old[ch].end());
+                    pcmf32s[ch].insert(pcmf32s[ch].end(), pcmf32s_new[ch].begin(), pcmf32s_new[ch].begin() + n_take);
+                }
+
+                // Save this buffer as the old for the next iteration
+                pcmf32_old = pcmf32;
+                pcmf32s_old = pcmf32s;
+                pcmf32_new.erase(pcmf32_new.begin(), pcmf32_new.begin() + n_take);
+                for (int ch =0 ; ch< pcmf32s_new.size(); ch++) {
+                    pcmf32s_new[ch].erase(pcmf32s_new[ch].begin(), pcmf32s_new[ch].begin() + n_take);
+                }
+
+                printf("processing segment: n_take = %.3f, n_over = %.3f, total = %.3f\n", n_take / (1.0 * WHISPER_SAMPLE_RATE), n_over / (1.0 * WHISPER_SAMPLE_RATE), (int) pcmf32.size() / (1.0 * WHISPER_SAMPLE_RATE));
             }
 
             // run the inference
