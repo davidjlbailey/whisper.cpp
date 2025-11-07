@@ -6,13 +6,12 @@
 #include "common-whisper.h"
 #include "whisper.h"
 
-#include <chrono>
-#include <cstdio>
-#include <cstring>
-#include <fstream>
-#include <string>
-#include <thread>
-#include <vector>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "common.h"
 #include "common-whisper.h"
@@ -99,6 +98,8 @@ struct whisper_params {
     // Additional parameters to run as a server
     bool run_server = false;
     int16_t server_port = 2700;
+    int stream_buffer = WHISPER_SAMPLE_RATE * 2;
+    int stream_overlap = WHISPER_SAMPLE_RATE * 8;
 
     std::string language  = "en";
     std::string prompt;
@@ -209,8 +210,10 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
         else if (arg == "-dl"   || arg == "--detect-language")      { params.detect_language = true; }
         else if (                  arg == "--prompt")               { params.prompt          = ARGV_NEXT; }
         else if (                  arg == "--carry-initial-prompt") { params.carry_initial_prompt = true; }
-        else if (                  arg == "--run-server")            { params.run_server      = true; }
+        else if (                  arg == "--run-server")           { params.run_server      = true; }
         else if (                  arg == "--server-port")          { params.server_port     = static_cast<int16_t>(std::stoi(ARGV_NEXT)); }
+        else if (                  arg == "--stream-buffer")        { params.stream_buffer   = static_cast<int16_t>(std::stoi(ARGV_NEXT)); }
+        else if (                  arg == "--stream-overlap")       { params.stream_overlap  = static_cast<int16_t>(std::stoi(ARGV_NEXT)); }
         else if (arg == "-m"    || arg == "--model")                { params.model           = ARGV_NEXT; }
         else if (arg == "-f"    || arg == "--file")                 { params.fname_inp.emplace_back(ARGV_NEXT); }
         else if (arg == "-oved" || arg == "--ov-e-device")          { params.openvino_encode_device = ARGV_NEXT; }
@@ -238,6 +241,15 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
             whisper_print_usage(argc, argv, params);
             exit(0);
         }
+    }
+
+    if (params.run_server && params.fname_inp.size() > 0) {
+        fprintf(stderr, "error: cannot use --run-server together with input files\n");
+        exit(0);
+    }
+    if (params.run_server) {
+        params.fname_inp.clear();
+        params.fname_inp.push_back("-"); // use stdin for server mode
     }
 
     return true;
@@ -294,6 +306,8 @@ static void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params
     fprintf(stderr, "             --carry-initial-prompt [%-7s] always prepend initial prompt\n",                  params.carry_initial_prompt ? "true" : "false");
     fprintf(stderr, "             --run-server           [%-7s] run as a server\n",                              params.run_server ? "true" : "false");
     fprintf(stderr, "             --server-port PORT     [%-7d] server port\n",                                  params.server_port);
+    fprintf(stderr, "             --stream-buffer N     [%-7d] stream buffer size\n",                             params.stream_buffer);
+    fprintf(stderr, "             --stream-overlap N     [%-7d] stream overlap\n",                               params.stream_overlap);
     fprintf(stderr, "  -m FNAME,  --model FNAME          [%-7s] model path\n",                                     params.model.c_str());
     fprintf(stderr, "  -f FNAME,  --file FNAME           [%-7s] input audio file path\n",                          "");
     fprintf(stderr, "  -oved D,   --ov-e-device DNAME    [%-7s] the OpenVINO device used for encode inference\n",  params.openvino_encode_device.c_str());
@@ -460,6 +474,30 @@ static void whisper_print_segment_callback(struct whisper_context * ctx, struct 
             printf("\n");
         }
 
+        fflush(stdout);
+    }
+}
+
+static void whisper_stream_segment_callback(struct whisper_context * ctx, struct whisper_state * /*state*/, int n_new, void * user_data) {
+
+    // First call the original print callback
+    whisper_print_segment_callback(ctx, nullptr, n_new, user_data);
+
+    const auto & params  = *((whisper_print_user_data *) user_data)->params;
+    const auto & pcmf32s = *((whisper_print_user_data *) user_data)->pcmf32s;
+
+    const int n_segments = whisper_full_n_segments(ctx);
+
+    // print the last n_new segments
+    const int s0 = n_segments - n_new;
+
+    if (s0 == 0) {
+        printf("\n");
+    }
+
+    for (int i = s0; i < n_segments; i++) {
+        const char * text = whisper_full_get_segment_text(ctx, i);
+        printf("STREAM: %s\n", text);
         fflush(stdout);
     }
 }
@@ -1000,7 +1038,7 @@ int main(int argc, char ** argv) {
         it++;
     }
 
-    if (params.fname_inp.empty()) {
+    if (params.fname_inp.empty() && !params.run_server) {
         fprintf(stderr, "error: no input files specified\n");
         whisper_print_usage(argc, argv, params);
         return 2;
@@ -1091,7 +1129,7 @@ int main(int argc, char ** argv) {
             const size_t basename_length;
             const bool is_stdout;
             bool used_stdout;
-            decltype(whisper_print_segment_callback) * const print_segment_callback;
+            decltype(whisper_stream_segment_callback) * const print_segment_callback;
             std::ofstream fout;
 
             fout_factory (const std::string & fname_out_, const std::string & fname_inp, whisper_params & params) :
@@ -1099,7 +1137,7 @@ int main(int argc, char ** argv) {
                     basename_length{fname_out.size()},
                     is_stdout{fname_out == "-"},
                     used_stdout{},
-                    print_segment_callback{is_stdout ? nullptr : whisper_print_segment_callback} {
+                    print_segment_callback{is_stdout ? nullptr : whisper_stream_segment_callback} {
                 if (!print_segment_callback) {
                     params.print_progress = false;
                 }
@@ -1138,9 +1176,44 @@ int main(int argc, char ** argv) {
         std::vector<float> pcmf32_full;               // mono-channel F32 PCM
         std::vector<std::vector<float>> pcmf32s_full; // stereo-channel F32 PCM
 
-        if (!::read_audio_data(fname_inp, pcmf32_full, pcmf32s_full, params.diarize)) {
-            fprintf(stderr, "error: failed to read audio file '%s'\n", fname_inp.c_str());
-            continue;
+        int socket_fd = -1;
+
+        if (params.run_server) {
+            socket_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+            if (socket_fd < 0) {
+                fprintf(stderr, "error: failed to create socket\n");
+                continue;
+            }
+            int opt = 1;
+            if (setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, (char *)&opt, sizeof(opt)) < 0) {
+                fprintf(stderr, "error: setsockopt(SO_REUSEADDR) failed\n");
+                close(socket_fd);
+                socket_fd = -1;
+                continue;
+            }
+            sockaddr_in addr ;
+            memset(&addr, 0, sizeof(in_addr));
+            addr.sin_family = AF_INET;
+            addr.sin_addr.s_addr = INADDR_ANY;
+            addr.sin_port = htons(params.server_port);
+            if (bind(socket_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+                fprintf(stderr, "error: bind() failed on port %d\n", params.server_port);
+                close(socket_fd);
+                socket_fd = -1;
+                continue;
+            }
+            if (listen(socket_fd, 1) < 0) {
+                fprintf(stderr, "error: listen() failed\n");
+                close(socket_fd);
+                socket_fd = -1;
+                continue;
+            }
+            fprintf(stderr, "%s: listening on port %d\n", __func__,  params.server_port);
+        } else {
+            if (!::read_audio_data(fname_inp, pcmf32_full, pcmf32s_full, params.diarize)) {
+                fprintf(stderr, "error: failed to read audio file '%s'\n", fname_inp.c_str());
+                continue;
+            }
         }
         
         if (!whisper_is_multilingual(ctx)) {
@@ -1191,17 +1264,63 @@ int main(int argc, char ** argv) {
         std::vector<std::vector<float>> pcmf32s_new = pcmf32s_full;
 
         // Parameters for overlapping segments
-        const int KEEP = WHISPER_SAMPLE_RATE * 10; // 10 seconds
-        const int OVER = WHISPER_SAMPLE_RATE * 8; // 8 seconds
-        const int STEP = KEEP - OVER; // 2 seconds
+        int STEP = params.stream_buffer;
+        int OVER = params.stream_overlap;
+        int KEEP = STEP + OVER;
+
+        // Socket connection
+        int client_fd = -1;
 
         // Loop over segments or socket reads
-        while (pcmf32_new.size() > 0) {
+        while (params.run_server || pcmf32_new.size() > 0) {
 
             // Read from socket and fill pcmf32_new and pcmf32s_new to STEP samples
             {
                 if (params.run_server) {
-                    // TODO - While new size is less than step, read from socket
+
+                    if (client_fd < 0) {
+                        // accept new connection
+                        sockaddr_in client_addr;
+                        socklen_t client_len = sizeof(client_addr);
+                        client_fd = accept(socket_fd, (struct sockaddr *)&client_addr, &client_len);
+                        if (client_fd < 0) {
+                            fprintf(stderr, "error: accept() failed\n");
+                            break;
+                        }
+                        fprintf(stderr, "%s: accepted connection\n", __func__);
+                    }
+
+                    while (pcmf32_new.size() < STEP) {
+                        // read data from socket
+                        const int n_bytes_to_read = (STEP - pcmf32_new.size()) * sizeof(float);
+                        std::vector<char> buffer(n_bytes_to_read);
+                        int n_bytes_read = recv(client_fd, buffer.data(), n_bytes_to_read, 0);
+                        if (n_bytes_read < 0) {
+                            fprintf(stderr, "error: recv() failed\n");
+                            close(client_fd);
+                            client_fd = -1;
+                            break;
+                        } else if (n_bytes_read == 0) {
+                            // connection closed
+                            fprintf(stderr, "%s: connection closed by peer\n", __func__);
+                            close(client_fd);
+                            client_fd = -1;
+                            break;
+                        } else {
+                            // append to pcmf32_new
+                            const int n_floats_read = n_bytes_read / sizeof(float);
+                            const float * data_ptr = reinterpret_cast<const float *>(buffer.data());
+                            pcmf32_new.insert(pcmf32_new.end(), data_ptr, data_ptr + n_floats_read);
+                            // fprintf(stderr, "%s: read %d bytes (%d floats)\n", __func__, n_bytes_read, n_floats_read);
+                        }
+                    }
+
+                    if (pcmf32_new.size() < STEP) {
+                        fprintf(stderr, "%s: connection closed before enough data was received\n", __func__);
+                        close(client_fd);
+                        client_fd = -1;
+                        break;
+                    }
                 }
 
             }
@@ -1347,6 +1466,28 @@ int main(int argc, char ** argv) {
                 if (whisper_full_parallel(ctx, wparams, pcmf32.data(), pcmf32.size(), params.n_processors) != 0) {
                     fprintf(stderr, "%s: failed to process audio\n", argv[0]);
                     return 10;
+                }
+            }
+
+            // Write the processed tokens to the socket
+            {
+                if (params.run_server && client_fd >= 0) {
+                    const int n_segments = whisper_full_n_segments(ctx);
+                    for (int i = 0; i < n_segments; ++i) {
+                        const char * text = whisper_full_get_segment_text(ctx, i);
+
+                        std::string message;
+                        message += std::string(text) + "\n";
+
+                        // send message
+                        int n_bytes_sent = send(client_fd, message.data(), message.size(), 0);
+                        if (n_bytes_sent < 0) {
+                            fprintf(stderr, "error: send() failed\n");
+                            close(client_fd);
+                            client_fd = -1;
+                            break;
+                        }
+                    }
                 }
             }
 
